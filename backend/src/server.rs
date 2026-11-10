@@ -1306,9 +1306,12 @@ async fn detect_pegout_deposit(state: &AppState, order: db::PegoutOrder, sync: b
         // Below the quoted amount is not this order's deposit. Binding the first dust transfer
         // would refund that dust, expire the quote, and leave the customer's later payment sitting
         // in the treasury with no order attached.
+        // A transfer that carries another order's key too is passed over: see
+        // `SolanaWallet::find_reference_deposit`.
+        let order_references = db::pegout_reference_pubkeys(&state.db).await?;
         let Some(deposit) = state
             .solana
-            .find_reference_deposit(&reference, order.amount_in_base_units as u64)
+            .find_reference_deposit(&reference, order.amount_in_base_units as u64, &order_references)
             .await?
         else {
             return Ok(order);
@@ -1328,7 +1331,8 @@ async fn detect_pegout_deposit(state: &AppState, order: db::PegoutOrder, sync: b
         let depositor_owner = deposit.depositor_owner.map(|p| p.to_string());
 
         // Conditional write, same reasoning as `update_deposit`: `order` may already have been
-        // moved past `pending` by another task.
+        // moved past `pending` by another task. It also loses if another order holds this
+        // transfer already, and then stays `pending`.
         if !db::record_pegout_deposit(
             &state.db,
             &order.id,
@@ -1341,7 +1345,8 @@ async fn detect_pegout_deposit(state: &AppState, order: db::PegoutOrder, sync: b
         .await?
         {
             eprintln!(
-                "[detect_pegout_deposit] order {}: already advanced by another task - re-reading",
+                "[detect_pegout_deposit] order {}: already advanced by another task, or {deposit_signature} \
+                 is another order's deposit - re-reading",
                 short(&order.id)
             );
             return Ok(db::get_pegout_order(&state.db, &order.id).await?.unwrap_or(order));
@@ -1453,6 +1458,18 @@ async fn try_fulfill_pegout(state: &AppState, order: db::PegoutOrder) -> anyhow:
         Ok(addr) => addr.assume_checked(),
         Err(e) => anyhow::bail!("stored ecx_recipient {:?} is invalid: {e}", order.ecx_recipient),
     };
+
+    // Several orders naming one transfer: at most one of them is owed anything, and which is for
+    // a person to say. `claim_for_pegout_payout` refuses them too; this says why.
+    if db::pegout_deposit_is_shared(&state.db, &order.id).await? {
+        eprintln!(
+            "[try_fulfill_pegout] order {}: its deposit {} is also another order's - not paying out, \
+             needs manual review",
+            short(&order.id),
+            order.deposit_signature.as_deref().unwrap_or("?")
+        );
+        return Ok(order);
+    }
 
     if !db::claim_for_pegout_payout(&state.db, &order.id).await? {
         eprintln!("[try_fulfill_pegout] order {}: lost payout claim race", short(&order.id));
@@ -1572,6 +1589,18 @@ async fn try_refund_pegout(state: &AppState, order: db::PegoutOrder) -> anyhow::
             "[try_refund_pegout] order {}: treasury SOL balance {sol_lamports} lamports is below \
              TREASURY_MIN_SOL_LAMPORTS - refund held, top the treasury up",
             short(&order.id)
+        );
+        return Ok(order);
+    }
+
+    // As in `try_fulfill_pegout`: one transfer is refunded at most once, and not by the poller
+    // when several orders name it.
+    if db::pegout_deposit_is_shared(&state.db, &order.id).await? {
+        eprintln!(
+            "[try_refund_pegout] order {}: its deposit {} is also another order's - not refunding, \
+             needs manual review",
+            short(&order.id),
+            order.deposit_signature.as_deref().unwrap_or("?")
         );
         return Ok(order);
     }
@@ -2126,8 +2155,11 @@ async fn scan_unmatched_deposits_once(state: &AppState) -> anyhow::Result<()> {
         // A failed transaction moved nothing, so there is nothing to fetch.
         let deposit = if entry.failed { None } else { state.solana.fetch_treasury_deposit(&entry.signature, true).await? };
         if let Some(deposit) = deposit {
+            // One reference key: that order's deposit, taken or about to be. Several: no order
+            // takes it (`SolanaWallet::find_reference_deposit`), so it is handled here like a
+            // deposit with none, instead of sitting in the treasury unrecorded.
             let belongs_to_an_order = db::is_pegout_deposit_signature(&state.db, &signature).await?
-                || deposit.account_keys.iter().any(|key| references.contains(key));
+                || deposit.order_references_carried(&references) == 1;
             if !belongs_to_an_order {
                 let owner = deposit.depositor_owner.map(|pk| pk.to_string());
                 let facts = UnmatchedFacts {
@@ -2574,9 +2606,10 @@ async fn revive_pegout_if_funded(
         return Ok(order);
     }
     let reference = solana::parse_pubkey(&order.reference_pubkey)?;
+    let order_references = db::pegout_reference_pubkeys(&state.db).await?;
     let found = state
         .solana
-        .find_reference_deposit(&reference, order.amount_in_base_units as u64)
+        .find_reference_deposit(&reference, order.amount_in_base_units as u64, &order_references)
         .await?;
     if found.is_none() || !db::revive_expired_pegout_order(&state.db, &order.id).await? {
         return Ok(order);

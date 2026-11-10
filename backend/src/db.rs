@@ -113,8 +113,9 @@ CREATE TABLE IF NOT EXISTS pegout_orders (
 CREATE INDEX IF NOT EXISTS pegout_orders_status_idx ON pegout_orders (status);
 
 -- Mirrors `bridge_orders_deposit_address_uidx`: each reference key is generated fresh per order
--- (see server::create_pegout_order) and handed out to exactly one, so a deposit transaction can
--- never be ambiguous about which order it belongs to.
+-- (see server::create_pegout_order) and handed out to exactly one. `record_pegout_deposit` lets a
+-- transaction be one order's deposit only, and the lookup passes over a transfer that carries
+-- more than one order's key.
 CREATE UNIQUE INDEX IF NOT EXISTS pegout_orders_reference_uidx
     ON pegout_orders (reference_pubkey);
 
@@ -1450,7 +1451,9 @@ pub async fn pegout_reserved_ecx_amount(conn: &Connection) -> Result<u64> {
 /// `amount_out_sat` to what actually landed, exactly like `update_deposit` does for the ECX side -
 /// the customer's wallet may not have sent precisely the quoted `amount_in_base_units`. Conditional
 /// on the order still being `pending`, for the same staleness reason `update_deposit` guards
-/// against. Returns `true` iff this call won the write.
+/// against, and on no order holding `deposit_signature` already: a transfer is one order's deposit.
+/// The statement is the check and the write at once, so two orders polled together cannot both
+/// take it. Returns `true` iff this call won the write.
 pub async fn record_pegout_deposit(
     conn: &Connection,
     id: &str,
@@ -1464,7 +1467,8 @@ pub async fn record_pegout_deposit(
         .execute(
             "UPDATE pegout_orders SET status = ?, deposit_signature = ?, depositor_owner = ?, \
              amount_in_base_units = ?, amount_out_sat = ?, updated_at = unixepoch() \
-             WHERE id = ? AND status = ?",
+             WHERE id = ? AND status = ? \
+             AND NOT EXISTS (SELECT 1 FROM pegout_orders AS other WHERE other.deposit_signature = ?)",
             (
                 status.label(),
                 deposit_signature,
@@ -1473,6 +1477,7 @@ pub async fn record_pegout_deposit(
                 to_i64(amount_out_sat)?,
                 id,
                 PegoutOrderStatus::Pending.label(),
+                deposit_signature,
             ),
         )
         .await
@@ -1499,11 +1504,34 @@ pub async fn confirm_pegout_deposit(conn: &Connection, id: &str) -> Result<bool>
     Ok(rows_affected > 0)
 }
 
-/// Mirrors `claim_for_payout`.
+/// The condition every unwrap send carries: no other order names this one's deposit. Orders that
+/// share a transfer are never paid or refunded by the poller - see `pegout_deposit_is_shared`.
+const SOLE_PEGOUT_DEPOSIT: &str = "NOT EXISTS (SELECT 1 FROM pegout_orders AS other \
+     WHERE other.id != pegout_orders.id AND other.deposit_signature = pegout_orders.deposit_signature)";
+
+/// Whether another order names the same deposit transfer as order `id`. Such an order needs a
+/// person: at most one of them is owed anything.
+pub async fn pegout_deposit_is_shared(conn: &Connection, id: &str) -> Result<bool> {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM pegout_orders AS mine JOIN pegout_orders AS other \
+             ON other.deposit_signature = mine.deposit_signature AND other.id != mine.id \
+             WHERE mine.id = ? LIMIT 1",
+            (id,),
+        )
+        .await
+        .context("failed to check for a shared pegout deposit")?;
+    Ok(rows.next().await?.is_some())
+}
+
+/// Mirrors `claim_for_payout`, and refuses an order whose deposit another order names too.
 pub async fn claim_for_pegout_payout(conn: &Connection, id: &str) -> Result<bool> {
     let rows_affected = conn
         .execute(
-            "UPDATE pegout_orders SET status = ?, updated_at = unixepoch() WHERE id = ? AND status = ?",
+            &format!(
+                "UPDATE pegout_orders SET status = ?, updated_at = unixepoch() \
+                 WHERE id = ? AND status = ? AND {SOLE_PEGOUT_DEPOSIT}"
+            ),
             (
                 PegoutOrderStatus::PayingOut.label(),
                 id,
@@ -1565,11 +1593,14 @@ pub async fn request_pegout_refund(conn: &Connection, id: &str) -> Result<bool> 
     Ok(rows_affected > 0)
 }
 
-/// Mirrors `claim_for_refund`.
+/// Mirrors `claim_for_refund`, and refuses an order whose deposit another order names too.
 pub async fn claim_for_pegout_refund(conn: &Connection, id: &str) -> Result<bool> {
     let rows_affected = conn
         .execute(
-            "UPDATE pegout_orders SET status = ?, updated_at = unixepoch() WHERE id = ? AND status = ?",
+            &format!(
+                "UPDATE pegout_orders SET status = ?, updated_at = unixepoch() \
+                 WHERE id = ? AND status = ? AND {SOLE_PEGOUT_DEPOSIT}"
+            ),
             (
                 PegoutOrderStatus::Refunding.label(),
                 id,
@@ -2437,5 +2468,127 @@ mod recent_order_tests {
         fees.sort();
         assert_eq!(fees, vec![(100, 0), (300, 0)]);
         assert!(list_active_pegout_orders(&conn).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_transfer_is_one_orders_deposit() {
+        let conn = Connection::in_memory_for_test().await;
+        const TRANSFER: &str = "sol-dep-shared";
+        const AMOUNT: u64 = 13_300_000_000;
+        const PAYOUT: u64 = 13_167_000_000;
+
+        let mut orders = Vec::new();
+        for n in 0..35 {
+            // Smaller than the transfer: the payout is repriced to what lands.
+            let order = insert_pegout_order(
+                &conn,
+                &NewPegoutOrder {
+                    amount_in_base_units: 50_506,
+                    amount_out_sat: 50_000,
+                    ecx_recipient: "bc1qecx1".to_string(),
+                    reference_pubkey: format!("ref-{n}"),
+                },
+            )
+            .await
+            .unwrap();
+            orders.push(order.id);
+        }
+
+        let mut recorded = 0;
+        for id in &orders {
+            if record_pegout_deposit(&conn, id, PegoutOrderStatus::DepositConfirmed, TRANSFER, Some("depositor-1"), AMOUNT, PAYOUT)
+                .await
+                .unwrap()
+            {
+                recorded += 1;
+            }
+        }
+        assert_eq!(recorded, 1, "the transfer is the first order's deposit and no other's");
+        assert_eq!(pegout_reserved_ecx_amount(&conn).await.unwrap(), PAYOUT, "ECX is reserved once");
+
+        let mut paid = 0;
+        for id in &orders {
+            let order = get_pegout_order(&conn, id).await.unwrap().unwrap();
+            if claim_for_pegout_payout(&conn, id).await.unwrap() {
+                paid += 1;
+                assert_eq!(order.deposit_signature.as_deref(), Some(TRANSFER));
+            } else {
+                // The rest never left `pending`, and keep the amounts they were created with.
+                assert_eq!(order.status, PegoutOrderStatus::Pending.label());
+                assert_eq!(order.deposit_signature, None);
+                assert_eq!(order.amount_out_sat, 50_000);
+            }
+        }
+        assert_eq!(paid, 1);
+
+        // An order of its own, with a transfer of its own, is untouched by all that.
+        let separate = insert_pegout_order(
+            &conn,
+            &NewPegoutOrder {
+                amount_in_base_units: 100_000,
+                amount_out_sat: 99_000,
+                ecx_recipient: "bc1qecx2".to_string(),
+                reference_pubkey: "ref-separate".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(record_pegout_deposit(&conn, &separate.id, PegoutOrderStatus::DepositConfirmed, "sol-dep-separate", Some("customer"), 100_000, 99_000)
+            .await
+            .unwrap());
+        assert!(!pegout_deposit_is_shared(&conn, &separate.id).await.unwrap());
+        assert!(claim_for_pegout_payout(&conn, &separate.id).await.unwrap());
+    }
+
+    /// Several orders name one transfer. None of them is paid or refunded by the poller.
+    #[tokio::test]
+    async fn orders_already_sharing_a_transfer_are_never_claimed() {
+        let conn = Connection::in_memory_for_test().await;
+        let mut ids = Vec::new();
+        for (n, status) in ["paid_out", "deposit_confirmed", "refund_requested"].into_iter().enumerate() {
+            let order = insert_pegout_order(
+                &conn,
+                &NewPegoutOrder {
+                    amount_in_base_units: 10_000_000_000,
+                    amount_out_sat: 9_900_000_000,
+                    ecx_recipient: "bc1qecx1".to_string(),
+                    reference_pubkey: format!("ref-{n}"),
+                },
+            )
+            .await
+            .unwrap();
+            // Written directly, past `record_pegout_deposit`'s check.
+            conn.execute(
+                "UPDATE pegout_orders SET status = ?, deposit_signature = 'shared-transfer', depositor_owner = 'depositor-1' WHERE id = ?",
+                (status, order.id.as_str()),
+            )
+            .await
+            .unwrap();
+            ids.push(order.id);
+        }
+
+        for id in &ids {
+            assert!(pegout_deposit_is_shared(&conn, id).await.unwrap());
+        }
+        assert!(!claim_for_pegout_payout(&conn, &ids[1]).await.unwrap());
+        assert!(!claim_for_pegout_refund(&conn, &ids[2]).await.unwrap());
+        assert_eq!(get_pegout_order(&conn, &ids[1]).await.unwrap().unwrap().status, "deposit_confirmed");
+        assert_eq!(get_pegout_order(&conn, &ids[2]).await.unwrap().unwrap().status, "refund_requested");
+
+        // And no new order takes that transfer either.
+        let late = insert_pegout_order(
+            &conn,
+            &NewPegoutOrder {
+                amount_in_base_units: 50_506,
+                amount_out_sat: 50_000,
+                ecx_recipient: "bc1qecx1".to_string(),
+                reference_pubkey: "ref-late".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!record_pegout_deposit(&conn, &late.id, PegoutOrderStatus::DepositConfirmed, "shared-transfer", Some("depositor-1"), 10_000_000_000, 9_900_000_000)
+            .await
+            .unwrap());
     }
 }

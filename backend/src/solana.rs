@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
@@ -346,10 +347,16 @@ impl SolanaWallet {
     /// which can still be dropped) - see `GetConfirmedSignaturesForAddress2Config`'s default
     /// commitment. `finalized` on the return value additionally reports whether it already meets
     /// the bar `try_fulfill_pegout` requires before paying out.
+    ///
+    /// `order_references` is every reference key handed to any order (`db::pegout_reference_pubkeys`).
+    /// A transfer that carries another order's key as well as `reference` is nobody's deposit (see
+    /// `ReferenceDeposit::names_another_order`). It is passed over, so a payment made afterwards
+    /// with this order's key alone still matches.
     pub async fn find_reference_deposit(
         &self,
         reference: &Pubkey,
         minimum_base_units: u64,
+        order_references: &HashSet<String>,
     ) -> Result<Option<ReferenceDeposit>> {
         // Walk newest-page backward, then consider candidates oldest-first. A dust transfer that
         // includes the reference must not become the order's deposit: that would close the order
@@ -402,6 +409,13 @@ impl SolanaWallet {
 
             if let Some(deposit) = self.fetch_treasury_deposit(&signature, finalized).await? {
                 if deposit.amount_base_units < minimum_base_units {
+                    continue;
+                }
+                if deposit.names_another_order(reference, order_references) {
+                    eprintln!(
+                        "[find_reference_deposit] {signature} carries more than one order's reference key - \
+                         not {reference}'s deposit, needs a manual look"
+                    );
                     continue;
                 }
                 return Ok(Some(deposit));
@@ -634,6 +648,28 @@ pub struct ReferenceDeposit {
     /// scan checks these against known order reference keys to tell an order's deposit from one
     /// that carries no reference.
     pub account_keys: Vec<String>,
+}
+
+impl ReferenceDeposit {
+    /// How many of `order_references` (every reference key handed to any order) this transfer
+    /// carries.
+    pub fn order_references_carried(&self, order_references: &HashSet<String>) -> usize {
+        let carried: HashSet<&String> = self
+            .account_keys
+            .iter()
+            .filter(|key| order_references.contains(*key))
+            .collect();
+        carried.len()
+    }
+
+    /// Whether this transfer carries the reference key of an order other than `reference`'s. A
+    /// reference key is only an extra account on the transfer, and a transfer can list several.
+    pub fn names_another_order(&self, reference: &Pubkey, order_references: &HashSet<String>) -> bool {
+        let own = reference.to_string();
+        self.account_keys
+            .iter()
+            .any(|key| *key != own && order_references.contains(key))
+    }
 }
 
 /// One entry of the treasury token account's history - see `SolanaWallet::list_treasury_signatures`.
@@ -971,5 +1007,64 @@ mod tests {
             false,
         );
         assert!(wallet.parse_reference_deposit(&outbound_tx, sig, true).unwrap().is_none());
+    }
+
+    /// One `TransferChecked` into the treasury whose accounts are its own four and many orders'
+    /// reference keys.
+    #[test]
+    fn a_transfer_listing_many_orders_keys_is_no_orders_deposit() {
+        let mint = Keypair::new().pubkey();
+        let wallet = SolanaWallet::for_test(Keypair::new(), mint, 8);
+        let treasury_ata = wallet.treasury_ata();
+        let sender = Keypair::new().pubkey();
+        let sender_ata = get_associated_token_address(&sender, &mint);
+        let references: Vec<Pubkey> = (0..35).map(|_| Keypair::new().pubkey()).collect();
+        let order_references: HashSet<String> = references.iter().map(Pubkey::to_string).collect();
+        const AMOUNT: u64 = 13_300_000_000;
+
+        let transfer = |carried: &[Pubkey]| {
+            let mut keys = vec![sender.to_string(), sender_ata.to_string(), mint.to_string(), treasury_ata.to_string()];
+            keys.extend(carried.iter().map(Pubkey::to_string));
+            let tx = build_encoded_tx(
+                keys,
+                None,
+                vec![
+                    token_balance(1, &mint, Some(&sender), AMOUNT),
+                    token_balance(3, &mint, Some(&wallet.pubkey()), 0),
+                ],
+                vec![
+                    token_balance(1, &mint, Some(&sender), 0),
+                    token_balance(3, &mint, Some(&wallet.pubkey()), AMOUNT),
+                ],
+                false,
+            );
+            wallet.parse_reference_deposit(&tx, Signature::new_unique(), true).unwrap().unwrap()
+        };
+
+        let shared = transfer(&references);
+        assert_eq!(shared.amount_base_units, AMOUNT);
+        assert_eq!(shared.order_references_carried(&order_references), 35);
+        // Not one of them may take it, the first included.
+        for reference in &references {
+            assert!(shared.names_another_order(reference, &order_references));
+        }
+
+        // Two keys are enough.
+        let pair = transfer(&references[..2]);
+        assert!(pair.names_another_order(&references[0], &order_references));
+        assert!(pair.names_another_order(&references[1], &order_references));
+
+        // A transfer with its own order's key and no other's is that order's.
+        let single = transfer(&references[..1]);
+        assert_eq!(single.order_references_carried(&order_references), 1);
+        assert!(!single.names_another_order(&references[0], &order_references));
+        // Read for another order, it is still not that order's.
+        assert!(single.names_another_order(&references[1], &order_references));
+
+        // Keys that are no order's (the sender, the mint, a stranger's) don't count.
+        let stranger = Keypair::new().pubkey();
+        let with_stranger = transfer(&[references[0], stranger]);
+        assert_eq!(with_stranger.order_references_carried(&order_references), 1);
+        assert!(!with_stranger.names_another_order(&references[0], &order_references));
     }
 }

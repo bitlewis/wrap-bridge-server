@@ -41,6 +41,12 @@ explorer (`ECX_EXPLORER_TX_URL`, derived from the Esplora URL by default, and
 and offers the link itself as a copy button and a QR code for moving between
 devices. Orders are also listed per browser at `/orders`, from local storage.
 
+**One transfer, one order.** A transfer that carries more than one order's
+reference key is no order's deposit: the lookup passes over it, and it is handled
+as an unmatched deposit (below). A transfer is recorded against one order at
+most, and the poller neither pays nor refunds an order whose deposit another
+order names too; those need a person.
+
 **Unmatched deposits.** A wECX transfer that reaches the treasury without any
 order's reference key (the customer pasted the treasury address into a wallet
 instead of opening the order's Solana Pay code) cannot be matched, and would
